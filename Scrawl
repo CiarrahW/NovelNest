@@ -1,0 +1,289 @@
+import requests
+import sqlite3
+import re
+import time, random
+from bs4 import BeautifulSoup
+from datetime import date
+from urllib.parse import urljoin, urlparse, parse_qs
+
+# 配置请求头（User-Agent 等）
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36"
+}
+
+# 晋江基础URL和排行榜URL模板
+BASE_URL = "https://www.jjwxc.net/"
+RANK_URL_TEMPLATE = "https://www.jjwxc.net/bookbase.php?sortType=4&collectiontypes=ors&page={page}"
+
+def extract_novelid(novel_url: str):
+    """从小说链接URL中提取 novelid 参数"""
+    query = parse_qs(urlparse(novel_url).query)
+    if "novelid" in query and query["novelid"]:
+        return int(query["novelid"][0])
+    # 部分链接格式可能不同，做额外处理
+    if "novelid=" in novel_url:
+        return int(novel_url.split("novelid=")[-1].split("&")[0])
+    return None
+
+def crawl_rank_page(page=1, limit=None):
+    """抓取排行榜列表页，返回该页上的小说概要列表"""
+    url = RANK_URL_TEMPLATE.format(page=page)
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+    except Exception as e:
+        print(f"获取第{page}页排行失败：", e)
+        return []
+    # 晋江页面编码为 GBK/GB18030，需要正确解析编码
+    resp.encoding = resp.apparent_encoding or "gb18030"
+    soup = BeautifulSoup(resp.text, "lxml")
+    rows = soup.find_all("tr")
+    novels = []
+    # 跳过表头，从第2行开始解析
+    for row in rows[1:]:
+        cols = row.find_all("td")
+        if len(cols) < 2:
+            continue
+        author = cols[0].get_text(strip=True)  # 作者名在第一列
+        title_tag = cols[1].find("a", href=True)
+        if not title_tag:
+            continue
+        novel_name = title_tag.get_text(strip=True)               # 小说名称
+        novel_url = urljoin(BASE_URL, title_tag["href"])          # 小说详情页URL
+        novel_id = extract_novelid(novel_url)                     # 小说ID
+        # 尝试从<a>标签的 title 属性中提取简介和标签（部分排行榜提供简介/标签作为tooltip）
+        intro = None
+        tags = None
+        title_attr = title_tag.get("title") or ""
+        if "简介：" in title_attr:
+            if "标签：" in title_attr:
+                # 将 tooltip 按“标签：”拆分为简介部分和标签部分
+                left, right = title_attr.split("标签：", 1)
+                intro = left.replace("简介：", "").strip()
+                tags = right.strip()
+            else:
+                intro = title_attr.replace("简介：", "").strip()
+        # 将获取的概要信息加入列表
+        novels.append({
+            "novel_id": novel_id,
+            "novel_name": novel_name,
+            "author": author,
+            "url": novel_url,
+            "intro": intro,
+            "tags": tags
+        })
+        # 如果设置了limit且已达到限制数量，则提前结束
+        if limit and len(novels) >= limit:
+            break
+    return novels
+
+def fetch_novel_detail(novel_url: str):
+    """抓取单本小说的详情页信息，返回解析后的字段字典"""
+    data = {}
+    try:
+        resp = requests.get(novel_url, headers=headers, timeout=15)
+    except Exception as e:
+        print(f"获取小说详情失败：{novel_url}, 原因：", e)
+        return data
+    # 晋江详情页通常为 GBK 编码
+    resp.encoding = "gb18030"
+    soup = BeautifulSoup(resp.text, "html.parser")
+    page_text = soup.get_text()  # 页面所有文本，用于搜索特定关键字
+
+    # 1. 小说简介（文案）
+    intro_div = soup.find('div', id='novelintro', attrs={"itemprop": "description"})
+    if intro_div:
+        # 获取完整简介文本（保持换行）
+        data['intro'] = intro_div.get_text("\n", strip=True)
+
+    # 2. 主角/配角/其它信息
+    # 通常在简介下方，以“主角：...┃ 配角：...┃ 其它：...”格式出现
+    idx = page_text.find("主角：")
+    if idx != -1:
+        snippet = page_text[idx: idx + 200]  # 截取约200字符的片段来解析主要角色信息
+        # 初始化字段
+        data['main_chars'] = None
+        data['support_chars'] = None
+        data['other_info'] = None
+        parts = snippet.split('┃')
+        for part in parts:
+            part = part.strip()
+            if part.startswith("主角："):
+                data['main_chars'] = part.replace("主角：", "").strip()
+            elif part.startswith("配角："):
+                data['support_chars'] = part.replace("配角：", "").strip()
+            elif part.startswith("其它："):
+                data['other_info'] = part.replace("其它：", "").strip()
+
+    # 3. 基本信息列表（类型、视角、字数、出版、签约状态等）
+    info_ul = soup.find('ul', attrs={'name': 'printright'})
+    if info_ul:
+        li_tags = info_ul.find_all('li')
+        for li in li_tags:
+            text = li.get_text(strip=True)
+            if text.startswith("文章类型："):
+                data['category'] = text.replace("文章类型：", "")
+            elif text.startswith("作品视角："):
+                data['perspective'] = text.replace("作品视角：", "")
+            elif text.startswith("所属系列："):
+                data['series'] = text.replace("所属系列：", "")
+            elif text.startswith("文章进度："):
+                data['status'] = text.replace("文章进度：", "")
+            elif text.startswith("全文字数："):
+                # 提取数字部分作为字数
+                num_str = "".join(filter(str.isdigit, text))
+                data['word_count'] = int(num_str) if num_str else None
+            elif text.startswith("版权转化："):
+                # 出版情况（“尚未出版” 或 已出版）
+                if "尚未出版" in text:
+                    data['publish_status'] = "尚未出版"
+                else:
+                    data['publish_status'] = "已出版" if li.find('img') else text.replace("版权转化：", "")
+            elif text.startswith("签约状态："):
+                # 签约状态可能包含在<font>标签中
+                font_tag = li.find('font')
+                if font_tag:
+                    data['sign_status'] = font_tag.get_text(strip=True)
+                else:
+                    data['sign_status'] = text.replace("签约状态：", "")
+
+    # 4. 底部统计数据（评论数、收藏数、营养液数、积分、非V点击等）
+    stats_div = soup.find('div', attrs={'align': 'center'})
+    if stats_div:
+        stats_text = stats_div.get_text()
+        # 使用正则从整段文本中提取所需数值
+        m = re.search(r"总书评数：(\d+).*?当前被收藏数：(\d+).*?营养液数：(\d+).*?文章积分：([\d,]+)", stats_text)
+        if m:
+            data['review_count']   = int(m.group(1))
+            data['favorite_count'] = int(m.group(2))
+            data['nutrient_count'] = int(m.group(3))
+            # 积分可能带逗号，去除逗号再转换
+            score_str = m.group(4).replace(',', '')
+            data['score'] = int(score_str) if score_str.isdigit() else None
+        # 非V章节总点击数
+        m2 = re.search(r"非V章节总点击数：(\d+)", stats_text)
+        if m2:
+            data['total_click_count'] = int(m2.group(1))
+
+    # 5. 最新更新时间和章节数
+    # 从页面文本中搜索“最新更新”关键字获取更新时间
+    if "最新更新" in page_text:
+        m3 = re.search(r"最新更新[:：](\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", page_text)
+        if m3:
+            data['last_update_time'] = m3.group(1)
+    # 统计章节总数（通过章节链接数目判断）
+    chapter_links = soup.find_all('a', href=re.compile(r'novelid=\d+&chapterid=\d+'))
+    data['chapter_count'] = len(chapter_links)
+
+    return data
+
+# 连接SQLite数据库（文件不存在会自动创建）
+conn = sqlite3.connect('jinjiang_novels.db')
+cur = conn.cursor()
+# 创建主要数据表（书籍基本信息表 和 统计信息表）
+cur.execute('''CREATE TABLE IF NOT EXISTS book (
+    book_id       INTEGER PRIMARY KEY,
+    title         TEXT,
+    author        TEXT,
+    intro         TEXT,
+    tags          TEXT,
+    main_chars    TEXT,
+    support_chars TEXT,
+    other_info    TEXT,
+    category      TEXT,
+    perspective   TEXT,
+    series        TEXT,
+    status        TEXT,
+    word_count    INTEGER,
+    publish_status TEXT,
+    sign_status    TEXT,
+    last_update_time TEXT,
+    chapter_count   INTEGER
+)''')
+cur.execute('''CREATE TABLE IF NOT EXISTS stats (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id         INTEGER,
+    date            TEXT,
+    review_count    INTEGER,
+    favorite_count  INTEGER,
+    nutrient_count  INTEGER,
+    total_click_count INTEGER,
+    score           INTEGER,
+    chapter_count   INTEGER,
+    FOREIGN KEY(book_id) REFERENCES book(book_id)
+)''')
+conn.commit()
+
+# 爬取排行榜前若干页以收集目标数量的小说
+target_count = 150  # 目标采集小说数量，可在100-200范围调整
+all_novel_list = []
+page = 1
+while len(all_novel_list) < target_count:
+    novels = crawl_rank_page(page=page)
+    if not novels:
+        break  # 没有拿到数据，可能到达末尾或发生错误
+    all_novel_list.extend(novels)
+    if len(all_novel_list) >= target_count:
+        break  # 已收集到足够数量的小说
+    page += 1
+    time.sleep(random.uniform(1.0, 2.0))  # 控制分页抓取节奏，休息1-2秒
+
+# 截断列表到需要的数量
+all_novel_list = all_novel_list[:target_count]
+
+# 遍历每本小说详情页，抓取详细信息并写入数据库
+for novel in all_novel_list:
+    novel_id   = novel['novel_id']
+    novel_name = novel['novel_name']
+    author     = novel['author']
+    novel_url  = novel['url']
+    # 获取详情页数据
+    detail = fetch_novel_detail(novel_url)
+    if not detail:
+        # 若详情获取失败则跳过
+        continue
+    # 优先使用详情页获取的完整简介和标签；如详情页无简介，则用列表页摘要
+    intro_text = detail.get('intro') or novel.get('intro') or ""
+    tags_text  = novel.get('tags') or detail.get('tags') or ""
+    # 从详情数据字典获取各字段值，若不存在则用None
+    main_chars    = detail.get('main_chars')
+    support_chars = detail.get('support_chars')
+    other_info    = detail.get('other_info')
+    category      = detail.get('category')
+    perspective   = detail.get('perspective')
+    series        = detail.get('series')
+    status        = detail.get('status')            # 连载状态（连载/完结）
+    word_count    = detail.get('word_count')
+    publish_status= detail.get('publish_status')
+    sign_status   = detail.get('sign_status')
+    last_update   = detail.get('last_update_time')
+    chapter_count = detail.get('chapter_count')
+
+    # 将基本信息插入或更新到 book 表
+    cur.execute('''INSERT OR REPLACE INTO book 
+        (book_id, title, author, intro, tags, main_chars, support_chars, other_info,
+         category, perspective, series, status, word_count,
+         publish_status, sign_status, last_update_time, chapter_count)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (novel_id, novel_name, author, intro_text, tags_text, main_chars, support_chars, other_info,
+         category, perspective, series, status, word_count,
+         publish_status, sign_status, last_update, chapter_count)
+    )
+    # 将当前爬取日期的动态数据插入到 stats 表
+    cur.execute('''INSERT INTO stats 
+        (book_id, date, review_count, favorite_count, nutrient_count, total_click_count, score, chapter_count)
+        VALUES (?,?,?,?,?,?,?,?)''',
+        (novel_id, date.today().isoformat(),
+         detail.get('review_count'), detail.get('favorite_count'),
+         detail.get('nutrient_count'), detail.get('total_click_count'),
+         detail.get('score'), detail.get('chapter_count'))
+    )
+    # 提交当前小说的数据（也可以每爬完一定数量再批量提交）
+    conn.commit()
+    # 控制抓取节奏，避免频繁请求被封禁
+    time.sleep(random.uniform(0.5, 1.0))
+
+# 关闭数据库连接
+conn.close()
+print(f"共采集{len(all_novel_list)}本小说的数据，已保存到数据库。")
+
