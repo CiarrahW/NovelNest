@@ -4,7 +4,24 @@
 	•	Source: Web-scraped or curated book metadata (title, author, synopsis, tags, stats, popularity, completion status).
 	•	Goal: Build a clean and consistent dataset for later modeling.
 	•	Format: books.csv stored in a lightweight SQL/CSV format.
-	•	Key Fields: title · author · intro · tags · popularity · status.
+	•	Format: features
+	book_id       INTEGER PRIMARY KEY,
+    title         TEXT,
+    author        TEXT,
+    intro         TEXT,
+    tags          TEXT,
+    main_chars    TEXT,
+    support_chars TEXT,
+    other_info    TEXT,
+    category      TEXT,
+    perspective   TEXT,
+    series        TEXT,
+    status        TEXT,
+    word_count    INTEGER,
+    publish_status TEXT,
+    sign_status    TEXT,
+    last_update_time TEXT,
+    chapter_count   INTEGER
 ### 2. Representation Layer — Text Processing & Embedding (NLP)
 	•	Preprocessing: Chinese tokenization (jieba), stopword removal, keyword extraction.
 	•	Feature Encoding:
